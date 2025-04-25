@@ -9,22 +9,24 @@
 #include "do_reproj.hpp"
 
 namespace aimer::aim {
-const float WEIGHTS[3] = { 4, 4, 2 };
-const uint8_t DIFF_STEP = 5;
-const uint8_t DIFF_THRESHOLD = 30;
-const cv::Size KERNEL1_SIZE = cv::Size(10, 10);
-const cv::Size KERNEL2_SIZE = cv::Size(4, 4);
-const cv::Scalar COLOR_LOWB = cv::Scalar(25, 40, 40);
-const cv::Scalar COLOR_UPB = cv::Scalar(90, 255, 255);
-const cv::Scalar MIN_VUE = cv::Scalar(0, 255 * .1, 255 * .2);
 
-// 测试如果一个轮廓中某个像素满足 test_is_bullet_color，那么这个就是弹丸
+// 常量区：定义帧差计算权重、阈值，以及形态学操作核尺寸
+const float WEIGHTS[3] = { 4, 4, 2 };        // RGB通道加权系数
+const uint8_t DIFF_STEP = 5;                 // 帧差采样步长，减少计算量
+const uint8_t DIFF_THRESHOLD = 30;           // 差分阈值，判定显著变化
+const cv::Size KERNEL1_SIZE = cv::Size(10, 10);  // 膨胀操作核大小
+const cv::Size KERNEL2_SIZE = cv::Size(4, 4);    // 开运算核大小
+const cv::Scalar COLOR_LOWB = cv::Scalar(25, 40, 40);   // HSV低阈颜色
+const cv::Scalar COLOR_UPB = cv::Scalar(90, 255, 255);  // HSV高阈颜色
+const cv::Scalar MIN_VUE = cv::Scalar(0, 255 * .1, 255 * .2); // 最低亮度过滤
+
+// 测试单像素是否满足“子弹颜色”特征：亮度足够，色相接近预设，并随饱和度/亮度做动态阈值
 bool test_is_bullet_color(const cv::Vec3b& hsv_col) {
     return hsv_col[2] > 50
         && fabs((int)hsv_col[0] - 50) < 10 + .5 * exp((hsv_col[1] + hsv_col[2]) / 100);
 }
 
-// 做帧差（并与原来的取交）
+// DoFrameDifference：基于 HSV 图像做帧差，并与原始掩码及历史子弹掩码取交
 cv::Mat DoFrameDifference::get_diff(
     const cv::Mat& s1,
     const cv::Mat& s2,
@@ -34,6 +36,7 @@ cv::Mat DoFrameDifference::get_diff(
     // cv::imshow("s1", s1);
     // cv::imshow("s2", s2);
     cv::Mat res = cv::Mat::zeros(s1.rows, s1.cols, CV_8U);
+    // 遍历图像，以步长 DIFF_STEP 采样点
     for (size_t y = 0; y < s1.rows; y += DIFF_STEP) {
         for (size_t x = 0; x < s1.cols; x += DIFF_STEP) {
             cv::Point p(x, y);
@@ -60,6 +63,7 @@ cv::Mat DoFrameDifference::get_diff(
             res.at<uint8_t>(p) = flag ? 255 : 0;
         }
     }
+    // 膨胀操作填充小洞，再合并上一帧子弹区域，避免漏检
     cv::dilate(res, res, this->kernel1);
     if (!lst_fr_bullets.empty()) {
         res |= lst_fr_bullets;
@@ -69,12 +73,13 @@ cv::Mat DoFrameDifference::get_diff(
     return res;
 }
 
+// DetectBullet 构造与初始化：创建形态学核并保存重投影对象
 DetectBullet::DetectBullet() {
-    this->kernel1 = cv::getStructuringElement(cv::MORPH_ELLIPSE, KERNEL1_SIZE);
-    this->kernel2 = cv::getStructuringElement(cv::MORPH_CROSS, KERNEL2_SIZE);
+    this->kernel1 = cv::getStructuringElement(cv::MORPH_ELLIPSE, KERNEL1_SIZE); // 椭圆核
+    this->kernel2 = cv::getStructuringElement(cv::MORPH_CROSS, KERNEL2_SIZE); // 十字核
 }
 
-void DetectBullet::init(const DoReproj& do_reproj) {
+void DetectBullet::init(const DoReproj& do_reproj) { //重投影
     this->do_reproj = do_reproj;
 }
 
@@ -82,7 +87,11 @@ DetectBullet::DetectBullet(const DoReproj& do_reproj) {
     this->init(do_reproj);
 }
 
-// 找出可能是子弹的区域
+// get_possible：筛选可能的子弹区域，流程如下：
+// 1) 重投影上一帧 HSV 到当前视角  
+// 2) HSV 范围过滤（色彩+亮度）  
+// 3) 帧差过滤静止背景  
+// 4) 开运算去噪，再找轮廓
 void DetectBullet::get_possible() {
     tme_get_possible -= (double)clock() / CLOCKS_PER_SEC;
 
@@ -124,6 +133,7 @@ void DetectBullet::get_possible() {
     }
 }
 
+// sort_points：对轮廓点先按 X 分桶，再对每列内的 Y 值排序，生成有序点集
 void DetectBullet::sort_points(std::vector<cv::Point>& vec) {
     tme_sort_points -= (double)clock() / CLOCKS_PER_SEC;
 
@@ -163,7 +173,7 @@ void DetectBullet::sort_points(std::vector<cv::Point>& vec) {
     tme_sort_points += (double)clock() / CLOCKS_PER_SEC;
 }
 
-// 找出一个轮廓中最亮的部分
+// test_is_bullet：在轮廓内部按列扫描，寻找最亮像素点并判断其是否符合子弹颜色
 bool DetectBullet::test_is_bullet(std::vector<cv::Point> contour) {
     this->sort_points(contour);
     tme_get_brightest -= (double)clock() / CLOCKS_PER_SEC;
@@ -186,7 +196,8 @@ bool DetectBullet::test_is_bullet(std::vector<cv::Point> contour) {
     return flag;
 }
 
-// 获取子弹位置、半径
+// get_bullets：基于筛选轮廓，进一步按面积、长宽比和亮度检测，
+// 并提取圆心与半径，结果保存到 bullets，同时生成下一帧遮罩 lst_msk
 void DetectBullet::get_bullets() {
     bullets.clear();
     this->lst_msk = cv::Mat::zeros(this->cur_frame.rows, this->cur_frame.cols, CV_8U);
@@ -215,7 +226,7 @@ void DetectBullet::get_bullets() {
     }
 }
 
-// 输出标出子弹的图像
+// print_bullets：可视化检测结果，将每颗子弹画圆输出
 cv::Mat DetectBullet::print_bullets() {
     cv::Mat res = this->cur_frame.clone();
     for (const ImageBullet& bul: this->bullets) {
@@ -226,6 +237,11 @@ cv::Mat DetectBullet::print_bullets() {
     return res;
 }
 
+// process_new_frame：主入口，执行以下步骤：
+// 1) 更新历史帧和四元数  
+// 2) 转换当前帧到 HSV  
+// 3) 调用 get_possible 筛选候选区域  
+// 4) 调用 get_bullets 提取最终子弹信息  
 std::vector<ImageBullet>
 DetectBullet::process_new_frame(const cv::Mat& new_frame, const Eigen::Quaterniond& q) {
     tme_total -= (double)clock() / CLOCKS_PER_SEC;
@@ -247,6 +263,7 @@ DetectBullet::process_new_frame(const cv::Mat& new_frame, const Eigen::Quaternio
 
     return this->bullets;
 }
+
 } // namespace aimer::aim
 
 #endif /* AIMER_AUTO_AIM_PREDICTOR_AIM_DETECT_BULLET_CPP */

@@ -1,253 +1,188 @@
-#ifndef AIMER_AUTO_AIM_PREDICTOR_AIM_DETECT_BULLET_CPP
-#define AIMER_AUTO_AIM_PREDICTOR_AIM_DETECT_BULLET_CPP
+// 辅助计算发射误差的模型。
+// 推导见 ../docs/latency.md。
+// 此校正方法假设瞄准(aim)
+// 计算无误，发射误差来源仅为机械结构、电控或视觉补偿参数错误。
 
-#include "detect_bullet.hpp"
+#ifndef AIMER_AUTO_AIM_PREDICTOR_AIM_AIM_CORRECTOR_HPP
+#define AIMER_AUTO_AIM_PREDICTOR_AIM_AIM_CORRECTOR_HPP
 
-#include <ctime>
-#include <opencv2/imgproc.hpp>
+#include <list>
 
-#include "do_reproj.hpp"
+#include "aimer/auto_aim/base/defs.hpp"
+#include "aimer/auto_aim/predictor/aim/detect_bullet.hpp"
+#include "aimer/base/math/filter/filter.hpp"
+#include "aimer/base/math/math.hpp"
+#include "aimer/base/robot/coord_converter.hpp"
 
 namespace aimer::aim {
-const float WEIGHTS[3] = { 4, 4, 2 };
-const uint8_t DIFF_STEP = 5;
-const uint8_t DIFF_THRESHOLD = 30;
-const cv::Size KERNEL1_SIZE = cv::Size(10, 10);
-const cv::Size KERNEL2_SIZE = cv::Size(4, 4);
-const cv::Scalar COLOR_LOWB = cv::Scalar(25, 40, 40);
-const cv::Scalar COLOR_UPB = cv::Scalar(90, 255, 255);
-const cv::Scalar MIN_VUE = cv::Scalar(0, 255 * .1, 255 * .2);
 
-// 测试如果一个轮廓中某个像素满足 test_is_bullet_color，那么这个就是弹丸
-bool test_is_bullet_color(const cv::Vec3b& hsv_col) {
-    return hsv_col[2] > 50
-        && fabs((int)hsv_col[0] - 50) < 10 + .5 * exp((hsv_col[1] + hsv_col[2]) / 100);
-}
-
-// 做帧差（并与原来的取交）
-cv::Mat DoFrameDifference::get_diff(
-    const cv::Mat& s1,
-    const cv::Mat& s2,
-    const cv::Mat& ref,
-    const cv::Mat& lst_fr_bullets) {
-    this->tme -= (double)clock() / CLOCKS_PER_SEC;
-    // cv::imshow("s1", s1);
-    // cv::imshow("s2", s2);
-    cv::Mat res = cv::Mat::zeros(s1.rows, s1.cols, CV_8U);
-    for (size_t y = 0; y < s1.rows; y += DIFF_STEP) {
-        for (size_t x = 0; x < s1.cols; x += DIFF_STEP) {
-            cv::Point p(x, y);
-            if (!ref.at<uint8_t>(p) || (!lst_fr_bullets.empty() && lst_fr_bullets.at<uint8_t>(p)))
-                continue;
-            const cv::Vec3b& c1 = s1.at<cv::Vec3b>(p);
-            bool flag = true;
-            for (int dy = -0; dy < 1 && flag; ++dy) {
-                int ty = y + dy;
-                if (ty < 0 || ty >= s1.rows)
-                    continue;
-                for (int dx = -0; dx < 1 && flag; ++dx) {
-                    int tx = x + dx;
-                    if (tx < 0 || tx >= s1.cols)
-                        continue;
-                    const cv::Vec3b& c2 = s2.at<cv::Vec3b>(cv::Point(tx, ty));
-                    uint8_t tmp = (WEIGHTS[0] * abs(c1[0] - c2[0]) + WEIGHTS[1] * abs(c1[1] - c2[1])
-                                   ▪ WEIGHTS[2] * abs(c1[2] - c2[2]))
-
-                        / (WEIGHTS[0] + WEIGHTS[1] + WEIGHTS[2]);
-                    if (tmp < DIFF_THRESHOLD)
-                        flag = false;
-                }
-            }
-            res.at<uint8_t>(p) = flag ? 255 : 0;
-        }
+/**
+ * @brief 记录瞄准命令的 id，原始图像时间，瞄准参数，校正参数
+ */
+struct IdTLatencyAimCorrection {
+    enum { INVALID_ID = -1 };
+    int id;
+    double img_t; // scheduled (implicit) = t + latency
+    double img_to_predict_latency;
+    aimer::AimInfo aim;
+    Eigen::Vector2d correction;
+    static auto invalid() -> IdTLatencyAimCorrection {
+        return IdTLatencyAimCorrection { IdTLatencyAimCorrection::INVALID_ID,
+                                         0.,
+                                         0.,
+                                         aimer::AimInfo::idle(),
+                                         Eigen::Vector2d(0., 0.) };
     }
-    cv::dilate(res, res, this->kernel1);
-    if (!lst_fr_bullets.empty()) {
-        res |= lst_fr_bullets;
-    }
-    // cv::imshow("diff", res);
-    this->tme += (double)clock() / CLOCKS_PER_SEC;
-    return res;
-}
+};
 
-DetectBullet::DetectBullet() {
-    this->kernel1 = cv::getStructuringElement(cv::MORPH_ELLIPSE, KERNEL1_SIZE);
-    this->kernel2 = cv::getStructuringElement(cv::MORPH_CROSS, KERNEL2_SIZE);
-}
+/**
+ * @brief 以 IdTAimCorrection 形式记录最近的瞄准(aim) 命令
+ */
+class AimHistory {
+public:
+    AimHistory(const std::size_t& max_sz);
 
-void DetectBullet::init(const DoReproj& do_reproj) {
-    this->do_reproj = do_reproj;
-}
+    // 非常神奇，当一个 id 被激活时，我们查询该 id 对应的 cmd 的估计发射时间 t
+    // 然后寻找 t 最近的 aimer::AimInfo，其中的 target_pos 可以来复现弹道
+    // id 命令发出的子弹对应的 aim 并不是 id 的
+    auto add_aim(const aim::IdTLatencyAimCorrection& aim) -> void;
+    auto get_id_cnt() const -> int;
 
-DetectBullet::DetectBullet(const DoReproj& do_reproj) {
-    this->init(do_reproj);
-}
+    // log 复杂度寻找 t 后面最接近的 aim
+    // 返回的 id 若是 0，表示未找到
+    auto find_by_img_t(const double& img_t) const -> aim::IdTLatencyAimCorrection;
+    auto find_by_id(const int& id) const -> aim::IdTLatencyAimCorrection;
 
-// 找出可能是子弹的区域
-void DetectBullet::get_possible() {
-    tme_get_possible -= (double)clock() / CLOCKS_PER_SEC;
+private:
+    const std::size_t max_sz;
+    int id_cnt = 0;
+    // 没有声明新签名，最近具名空间为 AimHistory，所以可直接 IdTAim。
+    std::deque<aim::IdTLatencyAimCorrection> aims;
+};
 
-    // 对上一帧的 hsv 进行重投影
-    assert(!this->lst_hsv.empty());
-    cv::Mat lst_reproj = this->do_reproj.reproj(this->lst_hsv, this->lst_fr_q, this->cur_fr_q);
+/**
+ * @class ProjectileSimulator
+ * @brief 存储一个子弹的发射信息并随时模拟其位置
+ */
+struct HitPos { 
+    bool hit;
+    Eigen::Vector3d pos;
+};
 
-    cv::Mat res, msk_not_dark;
-    // 先根据弹丸颜色判断可能是弹丸的部分
-    // 在一个大概的绿色范围内
-    cv::inRange(this->cur_hsv, COLOR_LOWB, COLOR_UPB, res);
-    // 不能太黑
-    cv::inRange(this->cur_hsv, MIN_VUE, cv::Scalar(255, 255, 255), msk_not_dark);
-    res &= msk_not_dark;
-    // cv::Mat tmp1 = res.clone();
+struct HitCircle {
+    bool hit;
+    aimer::math::CircleF circle;
+};
 
-    // 根据 hsv 作帧差
-    cv::Mat mat_diff = this->do_diff.get_diff(this->cur_hsv, lst_reproj, res, this->lst_msk);
-    // 如果上一帧某个位置有弹丸，需要考虑这一帧某颗弹丸跑到了同样的位置上
-    res &= mat_diff;
+struct CaughtCost {
+    bool caught;
+    double cost;
+};
 
-    // cv::Mat show_mat = res + (tmp1 - res) * .5;
-    // cv::imshow("show_mat", show_mat);
+class ProjectileSimulator {
+public:
+    ProjectileSimulator(
+        aimer::CoordConverter* const converter,
+        const aim::IdTLatencyAimCorrection& aim,
+        const double& fire_t
+    ):
+        converter { converter },
+        aim { aim },
+        fire_t { fire_t } {}
 
-    // 进行滤波
-    cv::morphologyEx(res, res, cv::MORPH_OPEN, this->kernel2);
+    auto get_aim_ref() const -> const aim::IdTLatencyAimCorrection&;
+    auto get_fire_t() const -> double;
 
-    tme_get_possible += (double)clock() / CLOCKS_PER_SEC;
+    // 声明了新的签名 get_pos，最近具名 scope 为 get_pos，需加 Proj.. 前缀。
+    // 保留 via t 接口是因为可以考虑二分 t 获取最优半径。
 
-    // 寻找轮廓
-    tme_find_contours -= (double)clock() / CLOCKS_PER_SEC;
-    std::vector<cv::Vec4i> hierarchy;
-    cv::findContours(res, this->contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-    tme_find_contours += (double)clock() / CLOCKS_PER_SEC;
-    for (const cv::Vec4i& vc: hierarchy) {
-        if (~vc[3]) {
-            // std::cerr << "Nested contours!" << std::endl;
-        }
-    }
-}
+    auto get_pos_by_t(const double& t) const -> aim::HitPos;
+    auto get_pos() const -> aim::HitPos;
 
-void DetectBullet::sort_points(std::vector<cv::Point>& vec) {
-    tme_sort_points -= (double)clock() / CLOCKS_PER_SEC;
+    auto get_circle_by_t(const double& t) const -> aim::HitCircle;
+    auto get_circle() const -> aim::HitCircle;
 
-    if (this->sort_pts.empty()) {
-        // 如果 sort_pts 没有初始化，那么先初始化
-        this->sort_pts = std::vector<std::vector<uint32_t>>(this->cur_frame.cols);
-    }
+    auto catch_circle(const aimer::math::CircleF& circle) const -> aim::CaughtCost;
 
-    uint32_t mn_x = this->cur_frame.cols, mx_x = 0;
-    for (const cv::Point& pt: vec) {
-        uint32_t x = pt.x, y = pt.y;
-        this->sort_pts[x].emplace_back(y);
-        if (x < mn_x)
-            mn_x = x;
-        if (x > mx_x)
-            mx_x = x;
-    }
-    std::vector<cv::Point>().swap(vec);
-    for (uint32_t x = mn_x; x <= mx_x; ++x) {
-        std::vector<uint32_t>& vc_x = this->sort_pts[x];
-        if (vc_x.size() > 10) {
-            sort(vc_x.begin(), vc_x.end());
-        } else {
-            for (uint32_t i = 0; i < vc_x.size(); ++i) {
-                for (uint32_t j = 0; j < i; ++j) {
-                    if (vc_x[j] > vc_x[i])
-                        std::swap(vc_x[i], vc_x[j]);
-                }
-            }
-        }
-        for (uint32_t y: vc_x) {
-            vec.emplace_back(x, y);
-        }
-        std::vector<uint32_t>().swap(vc_x);
-    }
+    auto fit_circle(const aimer::math::CircleF& circle) const -> aimer::math::CircleF;
 
-    tme_sort_points += (double)clock() / CLOCKS_PER_SEC;
-}
+private:
+    auto get_param_k() const -> double;
 
-// 找出一个轮廓中最亮的部分
-bool DetectBullet::test_is_bullet(std::vector<cv::Point> contour) {
-    this->sort_points(contour);
-    tme_get_brightest -= (double)clock() / CLOCKS_PER_SEC;
+    aimer::CoordConverter* const converter;
+    const double g { 9.8 }; // g = 9.8
+    // const double shoot_angle;
+    // const double v0;
+    const aim::IdTLatencyAimCorrection aim;
+    const double fire_t;
+};
 
-    this->sort_points(contour);
-    bool flag = false;
+/**
+ * @brief 自动模拟子弹和计算实际发射和理想发射误差
+ *
+ */
+struct IdPos {
+    int id;
+    Eigen::Vector3d pos;
+};
 
-    for (uint32_t i = 0, j = 0; i < contour.size() && !flag; i = j) {
-        int x = contour[i].x;
-        while (j < contour.size() && x == contour[j].x)
-            ++j;
-        assert(i < j);
-        for (int y = contour[i].y; y <= contour[j - 1].y && !flag; ++y) {
-            if (test_is_bullet_color(this->cur_hsv.at<cv::Vec3b>(cv::Point(x, y)))) {
-                flag = true;
-            }
-        }
-    }
-    tme_get_brightest += (double)clock() / CLOCKS_PER_SEC;
-    return flag;
-}
+struct IdCircle {
+    int id;
+    aimer::math::CircleF circle;
+};
 
-// 获取子弹位置、半径
-void DetectBullet::get_bullets() {
-    bullets.clear();
-    this->lst_msk = cv::Mat::zeros(this->cur_frame.rows, this->cur_frame.cols, CV_8U);
+// 存储被发射的子弹的模拟器
+struct IdProj {
+    int id;
+    aim::ProjectileSimulator proj;
+};
 
-    // std::cerr << "contours size = " << this->contours.size() << std::endl;
-    for (uint32_t i = 0; i < this->contours.size(); ++i) {
-        const std::vector<cv::Point>& contour = this->contours[i];
-        cv::RotatedRect rect = cv::minAreaRect(contour);
-        cv::Size rect_size = rect.size;
-        if (rect_size.area() < 30)
-            continue;
-        double ratio = cv::contourArea(contour) / rect_size.area();
-        if (ratio < 0.5)
-            continue;
-        if (this->test_is_bullet(contour)) {
-            this->bullets.emplace_back(
-                rect.center,
-                std::min(rect_size.height, rect_size.width) * .5);
-            cv::drawContours(
-                this->lst_msk,
-                contours,
-                i,
-                255,
-                cv::FILLED); // 在下一帧中作为上一帧识别到的子弹
-        }
-    }
-}
+class AimCorrector {
+public:
+    AimCorrector(aimer::CoordConverter* const converter);
+    auto add_aim(const aim::IdTLatencyAimCorrection& aim) -> void;
+    // 电控检测到新的子弹被发射，以 last_shoot_id 的方式给出。
+    // 若 id 切换时，我们尚无该 id 真正射出时的目标点。
+    // 将 id 放入准备区
+    auto update_bullet_id(const int& last_shoot_id) -> void;
 
-// 输出标出子弹的图像
-cv::Mat DetectBullet::print_bullets() {
-    cv::Mat res = this->cur_frame.clone();
-    for (const ImageBullet& bul: this->bullets) {
-        cv::circle(res, bul.center, bul.radius, cv::Scalar(255, 255, 255));
-    }
-    // cv::imshow("actual_res", res);
-    // cv::waitKey(0);
-    return res;
-}
+    // 该函数并非只读，且根据 converter 自动获取时间。
+    // 事实上，有些组件不得不获取四元数来继续计算。
+    auto get_bullets() -> std::vector<aim::IdPos>;
 
-std::vector<ImageBullet>
-DetectBullet::process_new_frame(const cv::Mat& new_frame, const Eigen::Quaterniond& q) {
-    tme_total -= (double)clock() / CLOCKS_PER_SEC;
+    auto get_circles() -> std::vector<aim::IdCircle>;
 
-    this->lst_hsv = this->cur_hsv.clone();
-    this->lst_frame = this->cur_frame.clone();
-    this->cur_frame = new_frame.clone();
-    this->lst_fr_q = this->cur_fr_q;
-    this->cur_fr_q = q;
+    /** @brief 采样一次瞄准误差 */
+    auto sample_aim_errors() -> void;
 
-    cv::cvtColor(this->cur_frame, this->cur_hsv, cv::COLOR_BGR2HSV);
+    auto get_aim_error() const -> Eigen::Vector2d;
 
-    if (!this->lst_frame.empty()) {
-        this->get_possible();
-        this->get_bullets();
-    }
+private:
+    // 对于一个子弹模拟器而言的 catch 写在哪里
 
-    tme_total += (double)clock() / CLOCKS_PER_SEC;
+    auto undistorted_circle(const aimer::math::CircleF& circle) -> aimer::math::CircleF;
 
-    return this->bullets;
-}
+    aimer::CoordConverter* const converter; // converter means NOW (current frame)
+    int last_shoot_id = 0;
+    aim::DetectBullet bullet_detector;
+    aim::AimHistory aim_history;
+
+    // Corrector 不得不包含模拟器实例，没办法
+    // 实例 -- t --> 给出坐标，我转换成图像中的圆
+    // simulator 捕获圆
+    std::list<aim::IdProj> bullets;
+    // 实例的管理
+
+    // 未找到对应发射信息的子弹序号队列
+    std::queue<int> pending_ids;
+    // 实例的运用
+
+    // 然而校正的响应有延迟。分别滤波 yaw 和 pitch
+    aimer::SingleFilter<1> error_filters[2];
+    // yaw, pitch
+    std::deque<Eigen::Vector2d> error_angles;
+};
+
 } // namespace aimer::aim
 
-#endif /* AIMER_AUTO_AIM_PREDICTOR_AIM_DETECT_BULLET_CPP */
+#endif /* AIMER_AUTO_AIM_PREDICTOR_AIM_AIM_CORRECTOR_HPP */
